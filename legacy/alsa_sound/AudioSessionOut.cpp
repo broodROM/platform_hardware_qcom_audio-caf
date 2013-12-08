@@ -27,8 +27,8 @@
 #include <math.h>
 
 #define LOG_TAG "AudioSessionOut"
-#define LOG_NDEBUG 0
-#define LOG_NDDEBUG 0
+//#define LOG_NDEBUG 0
+//#define LOG_NDDEBUG 0
 #include <utils/Log.h>
 #include <utils/String8.h>
 
@@ -58,7 +58,10 @@ namespace android_audio_legacy
 #define NUM_FDS 2
 #define KILL_EVENT_THREAD 1
 #define BUFFER_COUNT 4
-#define LPA_BUFFER_SIZE 256*1024
+#ifndef LPA_DEFAULT_BUFFER_SIZE
+#define LPA_DEFAULT_BUFFER_SIZE 256
+#endif
+#define LPA_BUFFER_SIZE LPA_DEFAULT_BUFFER_SIZE*1024
 #define TUNNEL_BUFFER_SIZE 240*1024
 #define TUNNEL_METADATA_SIZE 64
 #define MONO_CHANNEL_MODE 1
@@ -326,7 +329,7 @@ ssize_t AudioSessionOutALSA::write(const void *buffer, size_t bytes)
     updateMetaData(bytes);
 
     memcpy(buf.memBuf, &mOutputMetadataTunnel, mOutputMetadataLength);
-    ALOGD("buf.memBuf  =%x , Copy Metadata = %d,  bytes = %d", buf.memBuf,mOutputMetadataLength, bytes);
+    ALOGV("buf.memBuf  =%x , Copy Metadata = %d,  bytes = %d", buf.memBuf,mOutputMetadataLength, bytes);
 
     if (bytes == 0) {
         buf.bytesToWrite = 0;
@@ -372,7 +375,7 @@ ssize_t AudioSessionOutALSA::write(const void *buffer, size_t bytes)
         if (!mTunnelMode) mReachedEOS = true;
     }
     int32_t * Buf = (int32_t *) buf.memBuf;
-    ALOGD(" buf.memBuf [0] = %x , buf.memBuf [1] = %x",  Buf[0], Buf[1]);
+    ALOGV(" buf.memBuf [0] = %x , buf.memBuf [1] = %x",  Buf[0], Buf[1]);
     mFilledQueue.push_back(buf);
     if(!err) {
        //return the bytes written to HAL if write is successful.
@@ -1037,7 +1040,7 @@ void AudioSessionOutALSA::updateMetaData(size_t bytes) {
     mOutputMetadataTunnel.metadataLength = sizeof(mOutputMetadataTunnel);
     mOutputMetadataTunnel.timestamp = 0;
     mOutputMetadataTunnel.bufferLength =  bytes;
-    ALOGD("bytes = %d , mAlsaHandle->handle->period_size = %d, metadata = %d ",
+    ALOGV("bytes = %d , mAlsaHandle->handle->period_size = %d, metadata = %d ",
             mOutputMetadataTunnel.bufferLength, mAlsaHandle->handle->period_size, mOutputMetadataTunnel.metadataLength);
 }
 

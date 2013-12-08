@@ -232,8 +232,6 @@ status_t ALSAStreamOps::setParameters(const String8& keyValuePairs)
                         } else {
                             device = AudioSystem::DEVICE_IN_BUILTIN_MIC;
                         }
-                    } else {
-                        device = AudioSystem::DEVICE_IN_BUILTIN_MIC;
                     }
                 }
             }
@@ -255,7 +253,7 @@ status_t ALSAStreamOps::setParameters(const String8& keyValuePairs)
         }
         param.remove(key);
     }
-#ifdef QCOM_FM_ENABLED
+#if defined(QCOM_FM_ENABLED) || defined(STE_FM)
     else {
         key = String8(AudioParameter::keyHandleFm);
         if (param.getInt(key, device) == NO_ERROR) {

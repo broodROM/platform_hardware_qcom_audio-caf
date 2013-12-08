@@ -25,6 +25,10 @@
 #include <system/audio.h>
 #include <hardware/audio.h>
 
+#ifdef USES_AUDIO_AMPLIFIER
+#include <audio_amplifier.h>
+#endif
+
 #include <hardware_legacy/AudioHardwareInterface.h>
 #include <hardware_legacy/AudioSystemLegacy.h>
 
@@ -88,7 +92,7 @@ static uint32_t audio_device_conv_table[][HAL_API_REV_NUM] =
 #ifdef QCOM_PROXY_DEVICE_ENABLED
     { AudioSystem::DEVICE_OUT_PROXY, AUDIO_DEVICE_OUT_PROXY },
 #endif
-#ifdef QCOM_FM_ENABLED
+#if defined(QCOM_FM_ENABLED) || defined(STE_FM)
     { AudioSystem::DEVICE_OUT_FM, AUDIO_DEVICE_OUT_FM },
     { AudioSystem::DEVICE_OUT_FM_TX, AUDIO_DEVICE_OUT_FM_TX },
 #endif
@@ -111,7 +115,7 @@ static uint32_t audio_device_conv_table[][HAL_API_REV_NUM] =
 #ifdef QCOM_PROXY_DEVICE_ENABLED
     { AudioSystem::DEVICE_IN_PROXY, AUDIO_DEVICE_IN_PROXY },
 #endif
-#ifdef QCOM_FM_ENABLED
+#if defined(QCOM_FM_ENABLED) || defined(STE_FM)
     { AudioSystem::DEVICE_IN_FM_RX, AUDIO_DEVICE_IN_FM_RX },
     { AudioSystem::DEVICE_IN_FM_RX_A2DP, AUDIO_DEVICE_IN_FM_RX_A2DP },
 #endif
@@ -531,7 +535,7 @@ static uint32_t adev_get_supported_devices(const struct audio_hw_device *dev)
 #ifdef QCOM_PROXY_DEVICE_ENABLED
             AUDIO_DEVICE_OUT_PROXY |
 #endif
-#ifdef QCOM_FM_ENABLED
+#if defined(QCOM_FM_ENABLED) || defined(STE_FM)
             AUDIO_DEVICE_OUT_FM |
             AUDIO_DEVICE_OUT_FM_TX |
 #endif
@@ -556,7 +560,7 @@ static uint32_t adev_get_supported_devices(const struct audio_hw_device *dev)
 #ifdef QCOM_PROXY_DEVICE_ENABLED
             AUDIO_DEVICE_IN_PROXY |
 #endif
-#ifdef QCOM_FM_ENABLED
+#if defined(QCOM_FM_ENABLED) || defined(STE_FM)
             AUDIO_DEVICE_IN_FM_RX |
             AUDIO_DEVICE_IN_FM_RX_A2DP |
 #endif
@@ -591,6 +595,12 @@ static int adev_get_master_volume(struct audio_hw_device *dev, float *volume) {
 static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
 {
     struct qcom_audio_device *qadev = to_ladev(dev);
+
+#ifdef USES_AUDIO_AMPLIFIER
+    if (amplifier_set_mode(mode) != 0)
+        ALOGE("Failed setting amplifier mode");
+#endif
+
     return qadev->hwif->setMode(mode);
 }
 
@@ -782,6 +792,11 @@ static int qcom_adev_close(hw_device_t* device)
                         reinterpret_cast<struct audio_hw_device *>(device);
     struct qcom_audio_device *qadev = to_ladev(hwdev);
 
+#ifdef USES_AUDIO_AMPLIFIER
+    if (amplifier_close() != 0)
+        ALOGE("Amplifier close failed");
+#endif
+
     if (!qadev)
         return 0;
 
@@ -834,6 +849,11 @@ static int qcom_adev_open(const hw_module_t* module, const char* name,
     }
 
     *device = &qadev->device.common;
+
+#ifdef USES_AUDIO_AMPLIFIER
+    if (amplifier_open() != 0)
+        ALOGE("Amplifier initialization failed");
+#endif
 
     return 0;
 

@@ -36,8 +36,10 @@
 
 extern "C" {
     #include <sound/asound.h>
+#ifdef QCOM_COMPRESSED_AUDIO_ENABLED
     #include <sound/compress_params.h>
     #include <sound/compress_offload.h>
+#endif
     #include "alsa_audio.h"
     #include "msm8960_use_cases.h"
 }
@@ -335,6 +337,9 @@ private:
     int      getUseCaseType(const char *useCase);
     status_t setHDMIChannelCount();
     void     setChannelAlloc(int channelAlloc);
+#ifdef MOTOROLA_EMU_AUDIO
+    void     setEmuAntipop(int emuAntipop);
+#endif
     status_t setHardwareParams(alsa_handle_t *handle);
     int      deviceName(alsa_handle_t *handle, unsigned flags, char **value);
     status_t setSoftwareParams(alsa_handle_t *handle);
@@ -376,7 +381,10 @@ private:
     bool mIsSglte;
     bool mIsFmEnabled;
 #ifdef SEPERATED_AUDIO_INPUT
-    int mInput_source
+    int mInputSource;
+#endif
+#ifdef MOTOROLA_EMU_AUDIO
+    bool mIsEmuAntipopOn;
 #endif
 //   ALSAHandleList  *mDeviceList;
 
@@ -400,6 +408,14 @@ private:
         long mBufferTime;
     };
     struct proxy_params mProxyParams;
+
+#ifdef USE_A2220
+    int mA2220Fd;
+    int mA2220Mode;
+    Mutex mA2220Lock;
+
+    int setA2220Mode(int mode);
+#endif
 
 };
 
@@ -940,7 +956,7 @@ protected:
     void *mCsdHandle;
 
     //fluence key value: fluencepro, fluence, or none
-    char mFluenceKey[20];
+    char mFluenceKey[PROP_VALUE_MAX];
     //A2DP variables
     audio_stream_out   *mA2dpStream;
     audio_hw_device_t  *mA2dpDevice;

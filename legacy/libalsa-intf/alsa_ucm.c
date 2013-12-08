@@ -50,6 +50,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <ctype.h>
 #include <sys/stat.h>
@@ -61,13 +62,11 @@
 
 #include <linux/ioctl.h>
 #include "msm8960_use_cases.h"
-#if defined(QC_PROP)
-    #include "acdb-loader.h"
-#else
-    #define acdb_loader_send_voice_cal(rxacdb_id, txacdb_id) (-EPERM)
-    #define acdb_loader_send_audio_cal(acdb_id, capability) (-EPERM)
-    #define acdb_loader_send_anc_cal(acdb_id) (-EPERM)
-#endif
+
+static void (*acdb_send_voice_cal)(int, int);
+static void (*acdb_send_audio_cal)(int, int);
+static void (*acdb_send_anc_cal)(int);
+
 #define PARSE_DEBUG 0
 
 /**
@@ -711,7 +710,7 @@ int use_case_index)
     card_mctrl_t *ctrl_list;
     int list_size, index, verb_index, ret = 0, voice_acdb = 0, rx_id, tx_id;
     char *ident_value = NULL;
-    char current_mod[MAX_STR_LEN];
+    char current_mod[MAX_STR_LEN] = "";
 
     /* Check if voice call use case/modifier exists */
     if ((!strncmp(uc_mgr->card_ctxt_ptr->current_verb,
@@ -817,9 +816,16 @@ This happens when the modifier changes*/
                           (!strncmp(current_mod, SND_USE_CASE_MOD_PLAY_VOIP,
                            strlen(SND_USE_CASE_MOD_PLAY_VOIP)))) ||
                           (!uc_mgr->isFusion3Platform))
-                           acdb_loader_send_voice_cal(uc_mgr->current_rx_device,
-                                                    uc_mgr->current_tx_device);
-             }
+                        if (uc_mgr->acdb_handle) {
+                            acdb_send_voice_cal = dlsym(uc_mgr->acdb_handle,"acdb_loader_send_voice_cal");
+                            if (acdb_send_voice_cal == NULL) {
+                                ALOGE("Voice acdb: dlsym: Error:%s Loading acdb_loader_send_voice_cal", dlerror());
+                            } else {
+                                acdb_send_voice_cal(uc_mgr->current_rx_device,
+                                        uc_mgr->current_tx_device);
+                            }
+                        }
+            }
             free(ident_value);
             ident_value = NULL;
         }
@@ -936,9 +942,15 @@ const char *use_case, int enable, int ctrl_list_type, int uc_index)
                     ALOGD("acdb_id %d cap %d enable %d",
                                         ctrl_list[uc_index].acdb_id,
                             ctrl_list[uc_index].capability, enable);
-                    acdb_loader_send_audio_cal(
-                            ctrl_list[uc_index].acdb_id,
-                            ctrl_list[uc_index].capability);
+                    if (uc_mgr->acdb_handle) {
+                        acdb_send_audio_cal = dlsym(uc_mgr->acdb_handle,"acdb_loader_send_audio_cal");
+                        if (acdb_send_audio_cal == NULL) {
+                            ALOGE("dlsym: Error:%s Loading acdb_loader_send_audio_cal", dlerror());
+                        } else {
+                            acdb_send_audio_cal(ctrl_list[uc_index].acdb_id,
+                                    ctrl_list[uc_index].capability);
+                        }
+                    }
                 }
             }
             if (enable) {

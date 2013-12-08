@@ -17,8 +17,7 @@
  */
 
 #define LOG_TAG "ALSADevice"
-#define LOG_NDEBUG 0
-#define LOG_NDDEBUG 0
+//#define LOG_NDEBUG 0
 #include <utils/Log.h>
 #include <cutils/properties.h>
 #include <linux/ioctl.h>
@@ -27,11 +26,22 @@
 #include <media/AudioRecord.h>
 #include <dlfcn.h>
 #include <math.h>
+#ifdef USE_A2220
+#include <sound/a2220.h>
+#endif
+
+#ifdef USES_AUDIO_AMPLIFIER
+#include <audio_amplifier.h>
+#endif
+
 extern "C" {
 #ifdef QCOM_CSDCLIENT_ENABLED
 static int (*csd_disable_device)();
 static int (*csd_enable_device)(int, int, uint32_t);
+#ifdef CSD_FAST_CALL_SWITCH
 static int (*csd_enable_device_config)(int, int);
+#endif
+#ifdef NEW_CSDCLIENT
 static int (*csd_volume)(uint32_t, int);
 static int (*csd_mic_mute)(uint32_t, int);
 static int (*csd_wide_voice)(uint32_t, uint8_t);
@@ -39,6 +49,15 @@ static int (*csd_slow_talk)(uint32_t, uint8_t);
 static int (*csd_fens)(uint32_t, uint8_t);
 static int (*csd_start_voice)(uint32_t);
 static int (*csd_stop_voice)(uint32_t);
+#else
+static int (*csd_volume)(int);
+static int (*csd_mic_mute)(int);
+static int (*csd_wide_voice)(uint8_t);
+static int (*csd_slow_talk)(uint8_t);
+static int (*csd_fens)(uint8_t);
+static int (*csd_start_voice)(void);
+static int (*csd_stop_voice)(void);
+#endif
 #endif
 #ifdef QCOM_ACDB_ENABLED
 static int (*acdb_loader_get_ecrx_device)(int acdb_id);
@@ -71,10 +90,10 @@ namespace android_audio_legacy
 {
 
 ALSADevice::ALSADevice() {
+    mSSRComplete = false;
 #ifdef USES_FLUENCE_INCALL
     mDevSettingsFlag = TTY_OFF | DMIC_FLAG;
 #else
-    mSSRComplete = false;
     mDevSettingsFlag = TTY_OFF;
 #endif
     mBtscoSamplerate = 8000;
@@ -83,6 +102,9 @@ ALSADevice::ALSADevice() {
     mIsFmEnabled = false;
     //Initialize fm volume to value corresponding to unity volume	92
     mFmVolume = lrint((0.0 * 0x2000) + 0.5);
+#ifdef MOTOROLA_EMU_AUDIO
+    mIsEmuAntipopOn = false;
+#endif
     char value[128], platform[128], baseband[128];
 
     property_get("persist.audio.handset.mic",value,"0");
@@ -114,6 +136,15 @@ ALSADevice::ALSADevice() {
     mProxyParams.mProxyState = proxy_params::EProxyClosed;
     mProxyParams.mProxyPcmHandle = NULL;
 
+#ifdef USE_A2220
+    mA2220Fd = -1;
+    mA2220Mode = A2220_PATH_INCALL_RECEIVER_NSOFF;
+#endif
+
+#ifdef SEPERATED_AUDIO_INPUT
+    mInputSource = AUDIO_SOURCE_DEFAULT;
+#endif
+
     ALOGD("ALSA module opened");
 }
 
@@ -130,15 +161,46 @@ ALSADevice::~ALSADevice()
 }
 
 static bool isPlatformFusion3() {
-    char platform[128], baseband[128];
+    char platform[128], baseband[128], baseband_arch[128];
     property_get("ro.board.platform", platform, "");
     property_get("ro.baseband", baseband, "");
+    property_get("ro.baseband.arch", baseband_arch, "");
     if (!strcmp("msm8960", platform) &&
-        (!strcmp("mdm", baseband) || !strcmp("sglte2", baseband)))
+        (!strcmp("mdm", baseband) || !strcmp("sglte2", baseband) ||
+        !strcmp("mdm", baseband_arch)))
         return true;
     else
         return false;
 }
+
+#ifdef USE_A2220
+int ALSADevice::setA2220Mode(int mode)
+{
+    Mutex::Autolock autoLock(mA2220Lock);
+    int rc = -1;
+
+    if (mA2220Mode != mode) {
+        if (mA2220Fd < 0) {
+            mA2220Fd = ::open("/dev/audience_a2220", O_RDWR);
+            if (!mA2220Fd) {
+                ALOGE("%s: unable to open a2220 device!", __func__);
+                return rc;
+            } else {
+                ALOGI("%s: device opened, fd=%d", __func__, mA2220Fd);
+            }
+        }
+
+        rc = ioctl(mA2220Fd, A2220_SET_CONFIG, mode);
+        if (rc < 0)
+            ALOGE("%s: ioctl failed, errno=%d", __func__, errno);
+        else {
+            mA2220Mode = mode;
+            ALOGD("%s: set mode=%d", __func__, mode);
+        }
+    }
+    return rc;
+}
+#endif
 
 static bool shouldUseHandsetAnc(int flags, int inChannels)
 {
@@ -156,6 +218,7 @@ static int adjustFlagsForCsd(int flags, const char *rxDevice)
            is the only adaptive mode CSD Client cares about */
         adjustedFlags &= ~(ANC_FLAG);
     }
+
     ALOGD("%s: current Rx device: %s, flags: %x, adjustedFlags: %x",
             __FUNCTION__, rxDevice, flags, adjustedFlags);
     return adjustedFlags;
@@ -367,7 +430,11 @@ status_t ALSADevice::setHardwareParams(alsa_handle_t *handle)
                    format);
     param_set_mask(params, SNDRV_PCM_HW_PARAM_SUBFORMAT,
                    SNDRV_PCM_SUBFORMAT_STD);
+#ifdef SET_MIN_PERIOD_BYTES
+    param_set_min(params, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, reqBuffSize);
+#else
     param_set_int(params, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, reqBuffSize);
+#endif
     //Setting number of periods to 4. If the system is loaded and record
     // obtain buffer is seen increase PCM_RECORD_PERIOD_COUNT to a value between 4-16.
     if (!strncmp(handle->useCase, SND_USE_CASE_VERB_HIFI_REC,
@@ -493,7 +560,8 @@ void ALSADevice::switchDevice(alsa_handle_t *handle, uint32_t devices, uint32_t 
             devices = devices | (AudioSystem::DEVICE_OUT_WIRED_HEADPHONE |
                       AudioSystem::DEVICE_IN_BUILTIN_MIC);
         } else if ((devices & AudioSystem::DEVICE_OUT_EARPIECE) ||
-                   (devices & AudioSystem::DEVICE_IN_BUILTIN_MIC)) {
+                   (devices & AudioSystem::DEVICE_IN_BUILTIN_MIC) ||
+                  (devices & AudioSystem::DEVICE_OUT_ANLG_DOCK_HEADSET)) {
             if ((mode == AudioSystem::MODE_IN_COMMUNICATION) &&
                  (devices & AudioSystem::DEVICE_IN_BUILTIN_MIC)) {
                  if (!strncmp(mCurRxUCMDevice, SND_USE_CASE_DEV_SPEAKER,
@@ -584,6 +652,9 @@ void ALSADevice::switchDevice(alsa_handle_t *handle, uint32_t devices, uint32_t 
         if (csd_disable_device == NULL) {
             ALOGE("csd_client_disable_device is NULL");
         } else {
+#ifdef USE_ES325_2MIC
+            setMixerControl("ES325 2Mic Enable", 0, 0);
+#endif
             err = csd_disable_device();
             if (err < 0)
             {
@@ -653,6 +724,11 @@ void ALSADevice::switchDevice(alsa_handle_t *handle, uint32_t devices, uint32_t 
     ALOGV("%s,rxDev:%s, txDev:%s, curRxDev:%s, curTxDev:%s\n", __FUNCTION__, rxDevice, txDevice, mCurRxUCMDevice, mCurTxUCMDevice);
 
     if (rxDevice != NULL) {
+#ifdef MOTOROLA_EMU_AUDIO
+        if (mIsEmuAntipopOn && !AudioUtil::isDockConnected()) {
+            setEmuAntipop(0);
+        }
+#endif
         snd_use_case_set(handle->ucMgr, "_enadev", rxDevice);
         strlcpy(mCurRxUCMDevice, rxDevice, sizeof(mCurRxUCMDevice));
     }
@@ -679,6 +755,7 @@ void ALSADevice::switchDevice(alsa_handle_t *handle, uint32_t devices, uint32_t 
             tx_dev_id = DEVICE_SPEAKER_TX_ACDB_ID;
         }
 
+#ifdef CSD_FAST_CALL_SWITCH
         /* Parallelize codec configuration on APQ with CSD voice call
          * sequence on MDM. This will reduce in call device switch delay
          */
@@ -690,6 +767,7 @@ void ALSADevice::switchDevice(alsa_handle_t *handle, uint32_t devices, uint32_t 
                 ALOGE("csd_enable_device_config failed, error %d", err);
             }
         }
+#endif
     }
 #endif
 
@@ -743,7 +821,7 @@ void ALSADevice::switchDevice(alsa_handle_t *handle, uint32_t devices, uint32_t 
         free(use_case);
         use_case = NULL;
     }
-#ifdef QCOM_FM_ENABLED
+#if defined(QCOM_FM_ENABLED) || defined(STE_FM)
     if (rxDevice != NULL) {
         setFmVolume(mFmVolume);
     }
@@ -751,7 +829,8 @@ void ALSADevice::switchDevice(alsa_handle_t *handle, uint32_t devices, uint32_t 
 
 #ifdef QCOM_CSDCLIENT_ENABLED
     if (isPlatformFusion3() && (inCallDevSwitch == true)) {
-        if (rx_dev_id == DEVICE_SPEAKER_RX_ACDB_ID && tx_dev_id == DEVICE_HANDSET_TX_ACDB_ID) {
+        if (((rx_dev_id == DEVICE_SPEAKER_MONO_RX_ACDB_ID ) || (rx_dev_id == DEVICE_SPEAKER_STEREO_RX_ACDB_ID ))
+         && tx_dev_id == DEVICE_HANDSET_TX_ACDB_ID) {
             tx_dev_id = DEVICE_SPEAKER_TX_ACDB_ID;
         }
         ALOGV("rx_dev_id=%d, tx_dev_id=%d\n", rx_dev_id, tx_dev_id);
@@ -759,15 +838,57 @@ void ALSADevice::switchDevice(alsa_handle_t *handle, uint32_t devices, uint32_t 
         if (csd_enable_device == NULL) {
             ALOGE("csd_client_enable_device is NULL");
         } else {
+            int tmp_tx_id = tx_dev_id;
+            int tmp_rx_id = rx_dev_id;
+
+#ifdef USE_ES325_2MIC
+            if (!strcmp(rxDevice, SND_USE_CASE_DEV_VOC_EARPIECE) ||
+                    !strcmp(rxDevice, SND_USE_CASE_DEV_VOC_EARPIECE_XGAIN) ||
+                    !strcmp(rxDevice, SND_USE_CASE_DEV_VOC_SPEAKER)) {
+                if (tx_dev_id == 4) {
+                    tmp_tx_id = 34;
+                    setMixerControl("VEQ Enable", 1, 0);
+                    setMixerControl("ES325 2Mic Enable", 1, 0);
+                } else {
+                    setMixerControl("ES325 2Mic Enable", 0, 0);
+                }
+            }
+#endif
+#ifdef HTC_CSDCLIENT
+            if (tx_dev_id == DEVICE_BT_SCO_TX_ACDB_ID) {
+                tmp_tx_id = 1027;
+            }
+            if (rx_dev_id == DEVICE_BT_SCO_RX_ACDB_ID) {
+                tmp_rx_id = 1127;
+            }
+#endif
+
             int adjustedFlags = adjustFlagsForCsd(mDevSettingsFlag,
                     mCurRxUCMDevice);
-            err = csd_enable_device(rx_dev_id, tx_dev_id, adjustedFlags);
+            err = csd_enable_device(tmp_rx_id, tmp_tx_id, adjustedFlags);
             if (err < 0)
             {
-                ALOGE("csd_client_disable_device failed, error %d", err);
+                ALOGE("csd_enable_device failed, error %d", err);
             }
         }
     }
+#endif
+
+#ifdef USE_A2220
+    ALOGI("a2220: txDevice=%s rxDevice=%s", txDevice, rxDevice);
+    if (rxDevice != NULL && txDevice != NULL &&
+            (!strcmp(txDevice, SND_USE_CASE_DEV_DUAL_MIC_ENDFIRE) ||
+            !strcmp(txDevice, SND_USE_CASE_DEV_DUAL_MIC_BROADSIDE)) &&
+            (!strcmp(rxDevice, SND_USE_CASE_DEV_VOC_EARPIECE) ||
+             !strcmp(rxDevice, SND_USE_CASE_DEV_VOC_EARPIECE_XGAIN))) {
+        setA2220Mode(A2220_PATH_INCALL_RECEIVER_NSON);
+    } else {
+        setA2220Mode(A2220_PATH_INCALL_RECEIVER_NSOFF);
+    }
+#endif
+
+#ifdef USES_AUDIO_AMPLIFIER
+    amplifier_set_devices(devices);
 #endif
 
     if (rxDevice != NULL) {
@@ -1120,7 +1241,11 @@ status_t ALSADevice::startVoiceCall(alsa_handle_t *handle, uint32_t vsid)
         if (csd_start_voice == NULL) {
             ALOGE("csd_client_start_voice is NULL");
         } else {
+#ifdef NEW_CSDCLIENT
             err = csd_start_voice(vsid);
+#else
+            err = csd_start_voice();
+#endif
             if (err < 0){
                 ALOGE("s_start_voice_call: csd_client error %d\n", err);
                 goto Error;
@@ -1317,7 +1442,11 @@ status_t ALSADevice::close(alsa_handle_t *handle, uint32_t vsid)
             if (csd_stop_voice == NULL) {
                 ALOGE("csd_client_disable_device is NULL");
             } else {
+#ifdef NEW_CSDCLIENT
                 err = csd_stop_voice(vsid);
+#else
+                err = csd_stop_voice();
+#endif
                 if (err < 0) {
                     ALOGE("s_close: csd_client error %d\n", err);
                 }
@@ -1549,6 +1678,8 @@ char *ALSADevice::getUCMDeviceFromAcdbId(int acdb_id)
 
 char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
 {
+    char value[PROPERTY_VALUE_MAX];
+
     if (!input) {
         ALOGV("getUCMDevice for output device: devices:%x is input device:%d",devices,input);
         if (!(mDevSettingsFlag & TTY_OFF) &&
@@ -1579,11 +1710,35 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
             return strdup(SND_USE_CASE_DEV_PROXY_RX);
         } else if ((devices & AudioSystem::DEVICE_OUT_ANLG_DOCK_HEADSET ||
                     devices & AudioSystem::DEVICE_OUT_DGTL_DOCK_HEADSET) &&
+                    mCallMode != AUDIO_MODE_IN_CALL &&
                     devices & AudioSystem::DEVICE_OUT_SPEAKER) {
-             return strdup(SND_USE_CASE_DEV_USB_PROXY_RX_SPEAKER); /* USB PROXY RX + SPEAKER */
-        } else if ((devices & AudioSystem::DEVICE_OUT_ANLG_DOCK_HEADSET) ||
-                  (devices & AudioSystem::DEVICE_OUT_DGTL_DOCK_HEADSET)) {
-             return strdup(SND_USE_CASE_DEV_USB_PROXY_RX); /* PROXY RX */
+#if defined(SAMSUNG_AUDIO) || defined(MOTOROLA_EMU_AUDIO)
+            if (AudioUtil::isDockConnected()) {
+#ifdef MOTOROLA_EMU_AUDIO
+                if (!mIsEmuAntipopOn) {
+                    setEmuAntipop(1);
+                }
+                return strdup(SND_USE_CASE_DEV_DOCK_SPEAKER);
+#else
+                return strdup(SND_USE_CASE_DEV_DOCK);
+#endif
+            }
+#endif
+            return strdup(SND_USE_CASE_DEV_USB_PROXY_RX_SPEAKER); /* USB PROXY RX + SPEAKER */
+        } else if (((devices & AudioSystem::DEVICE_OUT_ANLG_DOCK_HEADSET) ||
+                  (devices & AudioSystem::DEVICE_OUT_DGTL_DOCK_HEADSET)) &&
+                  mCallMode != AUDIO_MODE_IN_CALL) {
+#if defined(SAMSUNG_AUDIO) || defined(MOTOROLA_EMU_AUDIO)
+            if (AudioUtil::isDockConnected()) {
+#ifdef MOTOROLA_EMU_AUDIO
+                if (!mIsEmuAntipopOn) {
+                    setEmuAntipop(1);
+                }
+#endif
+                return strdup(SND_USE_CASE_DEV_DOCK); /* Dock RX */
+            }
+#endif
+            return strdup(SND_USE_CASE_DEV_USB_PROXY_RX); /* PROXY RX */
 #ifdef QCOM_PROXY_DEVICE_ENABLED
         } else if( (devices & AudioSystem::DEVICE_OUT_SPEAKER) &&
                    (devices & AudioSystem::DEVICE_OUT_PROXY) &&
@@ -1616,7 +1771,7 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
             (devices & AudioSystem::DEVICE_OUT_ANC_HEADPHONE))) {
             return strdup(SND_USE_CASE_DEV_SPEAKER_ANC_HEADSET); /* COMBO SPEAKER+ANC HEADSET RX */
 #endif
-#ifdef QCOM_FM_ENABLED
+#if defined(QCOM_FM_ENABLED) || defined(STE_FM)
         } else if ((devices & AudioSystem::DEVICE_OUT_SPEAKER) &&
                  (devices & AudioSystem::DEVICE_OUT_FM_TX)) {
             return strdup(SND_USE_CASE_DEV_SPEAKER_FM_TX); /* COMBO SPEAKER+FM_TX RX */
@@ -1630,17 +1785,36 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
             return strdup(SND_USE_CASE_DEV_PROXY_RX_HANDSET); /* COMBO EARPIECE + PROXY RX */
 #endif
         } else if (devices & AudioSystem::DEVICE_OUT_EARPIECE) {
+#ifdef SEPERATED_VOIP
+            if (mCallMode == AUDIO_MODE_IN_COMMUNICATION) {
+                return strdup(SND_USE_CASE_DEV_VOIP_EARPIECE);
+            } else if (mCallMode == AUDIO_MODE_IN_CALL) {
+#else
             if (mCallMode == AUDIO_MODE_IN_CALL ||
                 mCallMode == AUDIO_MODE_IN_COMMUNICATION) {
+#endif
                 if (shouldUseHandsetAnc(mDevSettingsFlag, mInChannels)) {
                     return strdup(SND_USE_CASE_DEV_ANC_HANDSET); /* ANC Handset RX */
                 } else {
-                    return strdup(SND_USE_CASE_DEV_VOC_EARPIECE); /* Voice HANDSET RX */
+                    property_get("persist.audio.voc_ep.xgain", value, "");
+                    return strdup(strcmp(value, "1") == 0 ?
+                                SND_USE_CASE_DEV_VOC_EARPIECE_XGAIN :
+                                SND_USE_CASE_DEV_VOC_EARPIECE); /* Voice HANDSET RX */
                 }
             } else {
                 return strdup(SND_USE_CASE_DEV_EARPIECE); /* HANDSET RX */
             }
         } else if (devices & AudioSystem::DEVICE_OUT_SPEAKER) {
+#ifdef SEPERATED_VOIP
+            if (mCallMode == AUDIO_MODE_IN_COMMUNICATION) {
+                return strdup(SND_USE_CASE_DEV_VOIP_SPEAKER);
+            }
+#endif
+#ifdef SEPERATED_VOICE_SPEAKER
+            if (mCallMode == AUDIO_MODE_IN_CALL) {
+                return strdup(SND_USE_CASE_DEV_VOC_SPEAKER); /* Voice SPEAKER RX */
+            }
+#endif
             return strdup(SND_USE_CASE_DEV_SPEAKER); /* SPEAKER RX */
         } else if ((devices & AudioSystem::DEVICE_OUT_WIRED_HEADSET) ||
                    (devices & AudioSystem::DEVICE_OUT_WIRED_HEADPHONE)) {
@@ -1652,8 +1826,14 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
                     return strdup(SND_USE_CASE_DEV_ANC_HEADSET); /* ANC HEADSET RX */
                 }
             } else {
+#ifdef SEPERATED_VOIP
+                if (mCallMode == AUDIO_MODE_IN_COMMUNICATION) {
+                    return strdup(SND_USE_CASE_DEV_VOIP_HEADPHONE);
+                } else if (mCallMode == AUDIO_MODE_IN_CALL) {
+#else
                 if (mCallMode == AUDIO_MODE_IN_CALL ||
                     mCallMode == AUDIO_MODE_IN_COMMUNICATION) {
+#endif
                     return strdup(SND_USE_CASE_DEV_VOC_HEADPHONE); /* Voice HEADSET RX */
                 } else {
                     return strdup(SND_USE_CASE_DEV_HEADPHONES); /* HEADSET RX */
@@ -1690,7 +1870,7 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
         } else if (devices & AudioSystem::DEVICE_OUT_PROXY) {
             return strdup(SND_USE_CASE_DEV_PROXY_RX); /* PROXY RX */
 #endif
-#ifdef QCOM_FM_ENABLED
+#if defined(QCOM_FM_ENABLED) || defined(STE_FM)
         } else if (devices & AudioSystem::DEVICE_OUT_FM_TX) {
             return strdup(SND_USE_CASE_DEV_FM_TX); /* FM Tx */
 #endif
@@ -1725,22 +1905,26 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
             } else {
                 if ((mDevSettingsFlag & DMIC_FLAG) && (mInChannels == 1)) {
 #ifdef USES_FLUENCE_INCALL
-                    if(callMode == AUDIO_MODE_IN_CALL) {
-                        if (fluence_mode == FLUENCE_MODE_ENDFIRE) {
-                            return strdup(SND_USE_CASE_DEV_DUAL_MIC_ENDFIRE); /* DUALMIC EF TX */
-                        } else if (fluence_mode == FLUENCE_MODE_BROADSIDE) {
-                            return strdup(SND_USE_CASE_DEV_DUAL_MIC_BROADSIDE); /* DUALMIC BS TX */
-                        } else {
-                            return strdup(SND_USE_CASE_DEV_HANDSET); /* BUILTIN-MIC TX */
-                        }
-                    }
-#else
+                  if (mCallMode == AUDIO_MODE_IN_CALL
+#ifdef USES_FLUENCE_FOR_VOIP
+                          || mCallMode == AUDIO_MODE_IN_COMMUNICATION
+#endif
+                     ) {
+#endif
                     if (((rxDevice != NULL) &&
-                        !strncmp(rxDevice, SND_USE_CASE_DEV_SPEAKER,
-                        (strlen(SND_USE_CASE_DEV_SPEAKER)+1))) ||
+                        (!strncmp(rxDevice, SND_USE_CASE_DEV_SPEAKER,
+                        (strlen(SND_USE_CASE_DEV_SPEAKER)+1))
+#ifdef SEPERATED_VOICE_SPEAKER
+                        || !strncmp(rxDevice, SND_USE_CASE_DEV_VOC_SPEAKER,
+                        (strlen(SND_USE_CASE_DEV_VOC_SPEAKER)+1))
+#endif
+                        )) ||
                         ((rxDevice == NULL) &&
                         !strncmp(mCurRxUCMDevice, SND_USE_CASE_DEV_SPEAKER,
                         (strlen(SND_USE_CASE_DEV_SPEAKER)+1)))) {
+#ifdef SEPERATED_VOICE_SPEAKER_MIC
+                        return strdup(SND_USE_CASE_DEV_LINE); /* BUILTIN-MIC TX */
+#endif
                         if (mFluenceMode == FLUENCE_MODE_ENDFIRE) {
                             if (mIsSglte == false) {
                                 return strdup(SND_USE_CASE_DEV_SPEAKER_DUAL_MIC_ENDFIRE); /* DUALMIC EF TX */
@@ -1770,6 +1954,8 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
                             return strdup(SND_USE_CASE_DEV_DUAL_MIC_BROADSIDE); /* DUALMIC BS TX */
                         }
                     }
+#ifdef USES_FLUENCE_INCALL
+                  }
 #endif
                 } else if ((mDevSettingsFlag & DMIC_FLAG) && (mInChannels > 1)) {
                     if (((rxDevice != NULL) &&
@@ -1821,8 +2007,18 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
                 }
 #endif
 #ifdef SEPERATED_AUDIO_INPUT
-                if(mInput_source == AUDIO_SOURCE_VOICE_RECOGNITION) {
+                if(mInputSource == AUDIO_SOURCE_VOICE_RECOGNITION) {
                     return strdup(SND_USE_CASE_DEV_VOICE_RECOGNITION ); /* VOICE RECOGNITION TX */
+                }
+#endif
+#ifdef SEPERATED_VOIP
+                if (mCallMode == AUDIO_MODE_IN_COMMUNICATION) {
+                    if (!strncmp(rxDevice, SND_USE_CASE_DEV_VOIP_EARPIECE,
+                                (strlen(SND_USE_CASE_DEV_VOIP_EARPIECE)+1))) {
+                        return strdup(SND_USE_CASE_DEV_VOIP_HANDSET);
+                    } else {
+                        return strdup(SND_USE_CASE_DEV_VOIP_LINE);
+                    }
                 }
 #endif
                 else {
@@ -1838,6 +2034,19 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
         } else if (devices & AudioSystem::DEVICE_IN_AUX_DIGITAL) {
             return strdup(SND_USE_CASE_DEV_HDMI_TX); /* HDMI TX */
         } else if ((devices & AudioSystem::DEVICE_IN_WIRED_HEADSET)) {
+#ifdef SEPERATED_HEADSET_MIC
+#ifdef SEPERATED_VOIP
+            if (mCallMode == AUDIO_MODE_IN_COMMUNICATION) {
+                return strdup(SND_USE_CASE_DEV_VOIP_HEADSET);
+            }
+#endif
+            if (mCallMode == AUDIO_MODE_IN_CALL) {
+                return strdup(SND_USE_CASE_DEV_VOC_HEADSET);
+            }
+            if (mInputSource == AUDIO_SOURCE_VOICE_RECOGNITION) {
+                return strdup(SND_USE_CASE_DEV_VOICE_RECOGNITION_HEADSET);
+            }
+#endif
             return strdup(SND_USE_CASE_DEV_HEADSET); /* HEADSET TX */
 #ifdef QCOM_ANC_HEADSET_ENABLED
         } else if (devices & AudioSystem::DEVICE_IN_ANC_HEADSET) {
@@ -1877,7 +2086,7 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
             if (strncmp(mCurTxUCMDevice, "None", 4)) {
                 return strdup(mCurTxUCMDevice);
             }
-#ifdef QCOM_FM_ENABLED
+#if defined(QCOM_FM_ENABLED) || defined(STE_FM)
         } else if ((devices & AudioSystem::DEVICE_IN_FM_RX) ||
                    (devices & AudioSystem::DEVICE_IN_FM_RX_A2DP)) {
             /* Nothing to be done, use current tx device or set dummy device */
@@ -1894,9 +2103,9 @@ char* ALSADevice::getUCMDevice(uint32_t devices, int input, char *rxDevice)
                 return strdup(SND_USE_CASE_DEV_HANDSET); /* HANDSET TX */
             } else {
 #ifdef SEPERATED_AUDIO_INPUT
-                if (callMode == AUDIO_MODE_IN_CALL) {
+                if (mCallMode == AUDIO_MODE_IN_CALL) {
                     return strdup(SND_USE_CASE_DEV_VOC_LINE); /* Voice BUILTIN-MIC TX */
-                } else if(mInput_source == AUDIO_SOURCE_CAMCORDER) {
+                } else if(mInputSource == AUDIO_SOURCE_CAMCORDER) {
                     return strdup(SND_USE_CASE_DEV_CAMCORDER_TX ); /* CAMCORDER TX */
                 } else
 #endif
@@ -1921,7 +2130,11 @@ void ALSADevice::setVoiceVolume(int vol)
         if (csd_volume == NULL) {
             ALOGE("csd_client_volume is NULL");
         } else {
+#ifdef NEW_CSDCLIENT
             err = csd_volume(ALL_SESSION_VSID, vol);
+#else
+            err = csd_volume(vol);
+#endif
             if (err < 0) {
                 ALOGE("s_set_voice_volume: csd_client error %d", err);
             }
@@ -1942,7 +2155,11 @@ void ALSADevice::setVoice2Volume(int vol)
         if (csd_volume == NULL) {
             ALOGE("csd_client_volume is NULL");
         } else {
+#ifdef NEW_CSDCLIENT
             err = csd_volume(ALL_SESSION_VSID, vol);
+#else
+            err = csd_volume(vol);
+#endif
             if (err < 0) {
                 ALOGE("s_set_voice_volume: csd_client error %d", err);
             }
@@ -1963,7 +2180,11 @@ void ALSADevice::setVoLTEVolume(int vol)
         if (csd_volume == NULL) {
             ALOGE("csd_client_volume is NULL");
         } else {
+#ifdef NEW_CSDCLIENT
             err = csd_volume(ALL_SESSION_VSID, vol);
+#else
+            err = csd_volume(vol);
+#endif
             if (err < 0) {
                 ALOGE("s_set_voice_volume: csd_client error %d", err);
             }
@@ -1990,7 +2211,11 @@ void ALSADevice::setMicMute(int state)
         if (csd_mic_mute == NULL) {
             ALOGE("csd_mic_mute is NULL");
         } else {
+#ifdef NEW_CSDCLIENT
             err = csd_mic_mute(ALL_SESSION_VSID, state);
+#else
+            err = csd_mic_mute(state);
+#endif
             if (err < 0) {
                 ALOGE("s_set_mic_mute: csd_client error %d", err);
             }
@@ -2011,7 +2236,11 @@ void ALSADevice::setVoice2MicMute(int state)
         if (csd_mic_mute == NULL) {
             ALOGE("csd_mic_mute is NULL");
         } else {
+#ifdef NEW_CSDCLIENT
             err = csd_mic_mute(ALL_SESSION_VSID, state);
+#else
+            err = csd_mic_mute(state);
+#endif
             if (err < 0) {
                 ALOGE("s_set_mic_mute: csd_client error %d", err);
             }
@@ -2033,7 +2262,11 @@ void ALSADevice::setVoLTEMicMute(int state)
         if (csd_mic_mute == NULL) {
             ALOGE("csd_mic_mute is NULL");
         } else {
+#ifdef NEW_CSDCLIENT
             err = csd_mic_mute(ALL_SESSION_VSID, state);
+#else
+            err = csd_mic_mute(state);
+#endif
             if (err < 0) {
                 ALOGE("s_set_mic_mute: csd_client error %d", err);
             }
@@ -2101,7 +2334,11 @@ void ALSADevice::enableWideVoice(bool flag, uint32_t vsid)
         if (csd_wide_voice == NULL) {
             ALOGE("csd_wide_voice is NULL");
         } else {
+#ifdef NEW_CSDCLIENT
             err = csd_wide_voice(vsid, flag);
+#else
+            err = csd_wide_voice(flag);
+#endif
             if (err < 0) {
                 ALOGE("enableWideVoice: csd_client_wide_voice error %d", err);
             }
@@ -2134,7 +2371,11 @@ void ALSADevice::enableFENS(bool flag, uint32_t vsid)
         if (csd_fens == NULL) {
             ALOGE("csd_fens is NULL");
         } else {
+#ifdef NEW_CSDCLIENT
             err = csd_fens(vsid, flag);
+#else
+            err = csd_fens(flag);
+#endif
             if (err < 0) {
                 ALOGE("s_enable_fens: csd_client error %d", err);
             }
@@ -2159,7 +2400,11 @@ void ALSADevice::enableSlowTalk(bool flag, uint32_t vsid)
         if (csd_slow_talk == NULL) {
             ALOGE("csd_slow_talk is NULL");
         } else {
+#ifdef NEW_CSDCLIENT
             err = csd_slow_talk(vsid, flag);
+#else
+            err = csd_slow_talk(flag);
+#endif
             if (err < 0) {
                 ALOGE("s_enable_slow_talk: csd_client error %d", err);
             }
@@ -2244,6 +2489,16 @@ void ALSADevice::setChannelAlloc(int channelAlloc)
     free(setValues);
     return;
 }
+
+#ifdef MOTOROLA_EMU_AUDIO
+void ALSADevice::setEmuAntipop(int emuAntipop)
+{
+    ALOGD("Emu Antipop = %d", emuAntipop);
+    setMixerControl("EMU Antipop", emuAntipop, 0);
+    mIsEmuAntipopOn = emuAntipop == 1;
+    return;
+}
+#endif
 
 status_t ALSADevice::getMixerControl(const char *name, unsigned int &value, int index)
 {
@@ -2749,7 +3004,7 @@ status_t ALSADevice::getEDIDData(char *hdmiEDIDData)
     unsigned **EDIDData;
     EDIDData = (unsigned **)malloc((MAX_SHORT_AUDIO_DESC_CNT + 1)*sizeof(unsigned*));
                               // additional 1 byte for length of the EDID
-    unsigned count;
+    unsigned count = 0;
     if(EDIDData) {
         for (int i=0; i<MAX_SHORT_AUDIO_DESC_CNT + 1; i++) {
             EDIDData[i] = (unsigned*)malloc(1 * sizeof(unsigned));
@@ -2776,10 +3031,10 @@ status_t ALSADevice::getEDIDData(char *hdmiEDIDData)
 }
 
 #ifdef SEPERATED_AUDIO_INPUT
-void s_setInput(int input)
+void ALSADevice::setInput(int input) 
 {
-    mInput_source = input;
-    ALOGD("s_setInput() : input_source = %d",input_source);
+    mInputSource = input;
+    ALOGD("s_setInput() : input_source = %d",mInputSource);
 }
 #endif
 
@@ -2793,8 +3048,11 @@ void  ALSADevice::setCsdHandle(void* handle)
                                             "csd_client_disable_device");
     csd_enable_device = (int (*)(int,int,uint32_t))::dlsym(mcsd_handle,
                                                     "csd_client_enable_device");
+#ifdef CSD_FAST_CALL_SWITCH
     csd_enable_device_config = (int (*)(int,int))::dlsym(mcsd_handle,
                                                     "csd_client_enable_device_config");
+#endif
+#ifdef NEW_CSDCLIENT
     csd_start_voice = (int (*)(uint32_t))::dlsym(mcsd_handle,
                                                  "csd_client_start_voice");
     csd_stop_voice = (int (*)(uint32_t))::dlsym(mcsd_handle,
@@ -2809,6 +3067,27 @@ void  ALSADevice::setCsdHandle(void* handle)
                                                    "csd_client_fens");
     csd_slow_talk = (int (*)(uint32_t, uint8_t))::dlsym(mcsd_handle,
                                                         "csd_client_slow_talk");
+#else
+    csd_start_voice = (int (*)())::dlsym(mcsd_handle,
+#ifdef SAMSUNG_CSDCLIENT
+            "csd_client_start_voice_og"
+#else
+            "csd_client_start_voice"
+#endif
+            );
+    csd_stop_voice = (int (*)())::dlsym(mcsd_handle,
+#ifdef SAMSUNG_CSDCLIENT
+            "csd_client_stop_voice_og"
+#else
+            "csd_client_stop_voice"
+#endif
+            );
+    csd_volume = (int (*)(int))::dlsym(mcsd_handle, "csd_client_volume");
+    csd_mic_mute = (int (*)(int))::dlsym(mcsd_handle, "csd_client_mic_mute");
+    csd_wide_voice = (int (*)(uint8_t))::dlsym(mcsd_handle, "csd_client_wide_voice");
+    csd_fens = (int (*)(uint8_t))::dlsym(mcsd_handle, "csd_client_fens");
+    csd_slow_talk = (int (*)(uint8_t))::dlsym(mcsd_handle, "csd_client_slow_talk");
+#endif
 }
 #endif
 
