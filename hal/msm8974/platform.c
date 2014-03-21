@@ -31,12 +31,30 @@
 #include "platform.h"
 #include "audio_extn.h"
 #include "voice_extn.h"
+#include "sound/compress_params.h"
 
 #define MIXER_XML_PATH "/system/etc/mixer_paths.xml"
 #define MIXER_XML_PATH_AUXPCM "/system/etc/mixer_paths_auxpcm.xml"
 #define LIB_ACDB_LOADER "libacdbloader.so"
 #define AUDIO_DATA_BLOCK_MIXER_CTL "HDMI EDID"
 
+#define MAX_COMPRESS_OFFLOAD_FRAGMENT_SIZE (256 * 1024)
+#define MIN_COMPRESS_OFFLOAD_FRAGMENT_SIZE (2 * 1024)
+#define COMPRESS_OFFLOAD_FRAGMENT_SIZE_FOR_AV_STREAMING (2 * 1024)
+#define COMPRESS_OFFLOAD_FRAGMENT_SIZE (32 * 1024)
+
+/* Used in calculating fragment size for pcm offload */
+#define PCM_OFFLOAD_BUFFER_DURATION_FOR_AV 2000 /* 2 secs */
+#define PCM_OFFLOAD_BUFFER_DURATION_FOR_AV_STREAMING 100 /* 100 millisecs */
+
+/* MAX PCM fragment size cannot be increased  further due
+ * to flinger's cblk size of 1mb,and it has to be a multiple of
+ * 24 - lcm of channels supported by DSP
+ */
+#define MAX_PCM_OFFLOAD_FRAGMENT_SIZE (240 * 1024)
+#define MIN_PCM_OFFLOAD_FRAGMENT_SIZE (32 * 1024)
+
+#define ALIGN( num, to ) (((num) + (to-1)) & (~(to-1)))
 /*
  * This file will have a maximum of 38 bytes:
  *
@@ -144,6 +162,9 @@ static char * device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_OUT_SPEAKER_AND_ANC_HEADSET] = "speaker-and-anc-headphones",
     [SND_DEVICE_OUT_ANC_HANDSET] = "anc-handset",
     [SND_DEVICE_OUT_SPEAKER_PROTECTED] = "speaker-protected",
+    [SND_DEVICE_OUT_VOIP_HANDSET] = "voip-handset-comm",
+    [SND_DEVICE_OUT_VOIP_SPEAKER] = "voip-speaker-comm",
+    [SND_DEVICE_OUT_VOIP_HEADPHONES] = "voip-headset-comm",
 
     /* Capture sound devices */
     [SND_DEVICE_IN_HANDSET_MIC] = "handset-mic",
@@ -187,6 +208,9 @@ static char * device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_IN_HANDSET_STEREO_DMIC] = "handset-stereo-dmic-ef",
     [SND_DEVICE_IN_SPEAKER_STEREO_DMIC] = "speaker-stereo-dmic-ef",
     [SND_DEVICE_IN_CAPTURE_VI_FEEDBACK] = "vi-feedback",
+    [SND_DEVICE_IN_VOIP_HANDSET_MIC] = "voip-main-mic-comm",
+    [SND_DEVICE_IN_VOIP_SPEAKER_MIC] = "voip-sub-mic-comm",
+    [SND_DEVICE_IN_VOIP_HEADSET_MIC] = "voip-headset-mic-comm",
 };
 
 /* ACDB IDs (audio DSP path configuration IDs) for each sound device */
@@ -297,6 +321,9 @@ struct snd_device_index snd_device_name_index[SND_DEVICE_MAX] = {
     {TO_NAME_INDEX(SND_DEVICE_OUT_SPEAKER_AND_ANC_HEADSET)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_ANC_HANDSET)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_SPEAKER_PROTECTED)},
+    {TO_NAME_INDEX(SND_DEVICE_OUT_VOIP_HANDSET)},
+    {TO_NAME_INDEX(SND_DEVICE_OUT_VOIP_SPEAKER)},
+    {TO_NAME_INDEX(SND_DEVICE_OUT_VOIP_HEADPHONES)},
     {TO_NAME_INDEX(SND_DEVICE_IN_HANDSET_MIC)},
     {TO_NAME_INDEX(SND_DEVICE_IN_HANDSET_MIC_AEC)},
     {TO_NAME_INDEX(SND_DEVICE_IN_HANDSET_MIC_NS)},
@@ -338,6 +365,9 @@ struct snd_device_index snd_device_name_index[SND_DEVICE_MAX] = {
     {TO_NAME_INDEX(SND_DEVICE_IN_HANDSET_STEREO_DMIC)},
     {TO_NAME_INDEX(SND_DEVICE_IN_SPEAKER_STEREO_DMIC)},
     {TO_NAME_INDEX(SND_DEVICE_IN_CAPTURE_VI_FEEDBACK)},
+    {TO_NAME_INDEX(SND_DEVICE_IN_VOIP_HANDSET_MIC)},
+    {TO_NAME_INDEX(SND_DEVICE_IN_VOIP_SPEAKER_MIC)},
+    {TO_NAME_INDEX(SND_DEVICE_IN_VOIP_HEADSET_MIC)},
 };
 
 #define DEEP_BUFFER_PLATFORM_DELAY (29*1000LL)
@@ -1017,7 +1047,12 @@ snd_device_t platform_get_output_snd_device(void *platform, audio_devices_t devi
                 else
                     snd_device = SND_DEVICE_OUT_VOICE_ANC_HEADSET;
             } else {
-                snd_device = SND_DEVICE_OUT_VOICE_HEADPHONES;
+                if (voice_extn_compress_voip_is_active(adev) &&
+                        voice_extn_dedicated_voip_device_prop_check()) {
+                    snd_device = SND_DEVICE_OUT_VOIP_HEADPHONES;
+                } else {
+                    snd_device = SND_DEVICE_OUT_VOICE_HEADPHONES;
+                }
             }
         } else if (devices & AUDIO_DEVICE_OUT_ALL_SCO) {
             if (my_data->btsco_sample_rate == SAMPLE_RATE_16KHZ)
@@ -1025,7 +1060,12 @@ snd_device_t platform_get_output_snd_device(void *platform, audio_devices_t devi
             else
                 snd_device = SND_DEVICE_OUT_BT_SCO;
         } else if (devices & AUDIO_DEVICE_OUT_SPEAKER) {
-            snd_device = SND_DEVICE_OUT_VOICE_SPEAKER;
+            if (voice_extn_compress_voip_is_active(adev) &&
+                    voice_extn_dedicated_voip_device_prop_check()) {
+                snd_device = SND_DEVICE_OUT_VOIP_SPEAKER;
+            } else {
+                snd_device = SND_DEVICE_OUT_VOICE_SPEAKER;
+            }
         } else if (devices & AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET ||
                    devices & AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET) {
             snd_device = SND_DEVICE_OUT_USB_HEADSET;
@@ -1034,6 +1074,9 @@ snd_device_t platform_get_output_snd_device(void *platform, audio_devices_t devi
         } else if (devices & AUDIO_DEVICE_OUT_EARPIECE) {
             if (audio_extn_should_use_handset_anc(channel_count))
                 snd_device = SND_DEVICE_OUT_ANC_HANDSET;
+            else if (voice_extn_compress_voip_is_active(adev) &&
+                    voice_extn_dedicated_voip_device_prop_check())
+                snd_device = SND_DEVICE_OUT_VOIP_HANDSET;
             else
                 snd_device = SND_DEVICE_OUT_VOICE_HANDSET;
         }
@@ -1189,7 +1232,15 @@ snd_device_t platform_get_input_snd_device(void *platform, audio_devices_t out_d
         if (out_device & AUDIO_DEVICE_OUT_SPEAKER)
             in_device = AUDIO_DEVICE_IN_BACK_MIC;
         if (adev->active_input) {
-            if (adev->active_input->enable_aec &&
+            if (voice_extn_dedicated_voip_device_prop_check()) {
+                if (in_device & AUDIO_DEVICE_IN_BACK_MIC) {
+                    snd_device = SND_DEVICE_IN_VOIP_SPEAKER_MIC;
+                } else if (in_device & AUDIO_DEVICE_IN_BUILTIN_MIC) {
+                    snd_device = SND_DEVICE_IN_VOIP_HANDSET_MIC;
+                } else if (in_device & AUDIO_DEVICE_IN_WIRED_HEADSET) {
+                    snd_device = SND_DEVICE_IN_VOIP_HEADSET_MIC;
+                }
+            } else if (adev->active_input->enable_aec &&
                     adev->active_input->enable_ns) {
                 if (in_device & AUDIO_DEVICE_IN_BACK_MIC) {
                     if (my_data->fluence_type & FLUENCE_DUAL_MIC &&
@@ -1456,8 +1507,9 @@ int platform_set_parameters(void *platform, struct str_parms *parms)
     char value[256] = {0};
     int val;
     int ret = 0, err;
+    char *kv_pairs = str_parms_to_str(parms);
 
-    ALOGV("%s: enter: %s", __func__, str_parms_to_str(parms));
+    ALOGV_IF(kv_pairs != NULL, "%s: enter: %s", __func__, kv_pairs);
 
     err = str_parms_get_int(parms, AUDIO_PARAMETER_KEY_BTSCO, &val);
     if (err >= 0) {
@@ -1502,6 +1554,7 @@ int platform_set_parameters(void *platform, struct str_parms *parms)
     }
 
     ALOGV("%s: exit with code(%d)", __func__, ret);
+    free(kv_pairs);
     return ret;
 }
 
@@ -1600,6 +1653,7 @@ void platform_get_parameters(void *platform,
     char value[256] = {0};
     int ret;
     int fluence_type;
+    char *kv_pairs = NULL;
 
     ret = str_parms_get_str(query, AUDIO_PARAMETER_KEY_FLUENCE_TYPE,
                             value, sizeof(value));
@@ -1635,7 +1689,9 @@ void platform_get_parameters(void *platform,
         str_parms_add_str(reply, AUDIO_PARAMETER_KEY_VOLUME_BOOST, value);
     }
 
-    ALOGV("%s: exit: returns - %s", __func__, str_parms_to_str(reply));
+    kv_pairs = str_parms_to_str(reply);
+    ALOGV_IF(kv_pairs != NULL, "%s: exit: returns - %s", __func__, kv_pairs);
+    free(kv_pairs);
 }
 
 /* Delay in Us */
@@ -1678,4 +1734,69 @@ void change_table_data(int key, char value[]){
     //ALOGE("%s: shareefdebug :%s", "device_table[key]", device_table[key]);
     device_table[key] = value;
     //ALOGE("%s: shareefdebug :%s", "device_table[key]", device_table[key]);
+}
+
+/* Read  offload buffer size from a property.
+ * If value is not power of 2  round it to
+ * power of 2.
+ */
+uint32_t platform_get_compress_offload_buffer_size(audio_offload_info_t* info)
+{
+    char value[PROPERTY_VALUE_MAX] = {0};
+    uint32_t fragment_size = COMPRESS_OFFLOAD_FRAGMENT_SIZE;
+    if((property_get("audio.offload.buffer.size.kb", value, "")) &&
+            atoi(value)) {
+        fragment_size =  atoi(value) * 1024;
+    }
+
+    if (info != NULL && info->has_video && info->is_streaming) {
+        fragment_size = COMPRESS_OFFLOAD_FRAGMENT_SIZE_FOR_AV_STREAMING;
+        ALOGV("%s: offload fragment size reduced for AV streaming to %d",
+               __func__, fragment_size);
+    }
+
+    fragment_size = ALIGN( fragment_size, 1024);
+
+    if(fragment_size < MIN_COMPRESS_OFFLOAD_FRAGMENT_SIZE)
+        fragment_size = MIN_COMPRESS_OFFLOAD_FRAGMENT_SIZE;
+    else if(fragment_size > MAX_COMPRESS_OFFLOAD_FRAGMENT_SIZE)
+        fragment_size = MAX_COMPRESS_OFFLOAD_FRAGMENT_SIZE;
+    ALOGV("%s: fragment_size %d", __func__, fragment_size);
+    return fragment_size;
+}
+
+uint32_t platform_get_pcm_offload_buffer_size(audio_offload_info_t* info)
+{
+    uint32_t fragment_size = MIN_PCM_OFFLOAD_FRAGMENT_SIZE;
+    uint32_t bits_per_sample = 16;
+
+    if (info->format == AUDIO_FORMAT_PCM_24_BIT_OFFLOAD) {
+        bits_per_sample = 32;
+    }
+
+    if (!info->has_video) {
+        fragment_size = MAX_PCM_OFFLOAD_FRAGMENT_SIZE;
+
+    } else if (info->has_video && info->is_streaming) {
+        fragment_size = (PCM_OFFLOAD_BUFFER_DURATION_FOR_AV_STREAMING
+                                     * info->sample_rate
+                                     * bits_per_sample
+                                     * popcount(info->channel_mask))/1000;
+
+    } else if (info->has_video) {
+        fragment_size = (PCM_OFFLOAD_BUFFER_DURATION_FOR_AV
+                                     * info->sample_rate
+                                     * bits_per_sample
+                                     * popcount(info->channel_mask))/1000;
+    }
+
+    fragment_size = ALIGN( fragment_size, 1024);
+
+    if(fragment_size < MIN_PCM_OFFLOAD_FRAGMENT_SIZE)
+        fragment_size = MIN_PCM_OFFLOAD_FRAGMENT_SIZE;
+    else if(fragment_size > MAX_PCM_OFFLOAD_FRAGMENT_SIZE)
+        fragment_size = MAX_PCM_OFFLOAD_FRAGMENT_SIZE;
+
+    ALOGV("%s: fragment_size %d", __func__, fragment_size);
+    return fragment_size;
 }
